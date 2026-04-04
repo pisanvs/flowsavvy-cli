@@ -1,0 +1,8 @@
+# Never commit credentials
+*.auth
+auth
+.env
+
+# Temp files
+/tmp/
+*.tsv.bak

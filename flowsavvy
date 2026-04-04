@@ -1,0 +1,221 @@
+#!/usr/bin/env bash
+# flowsavvy — Create tasks in FlowSavvy from the CLI
+#
+# Usage:
+#   flowsavvy add "Title" "YYYY-MM-DD" "HH:MM" "HH:MM" DURATION_MIN ["Notes"]
+#   flowsavvy batch FILE.tsv
+#   flowsavvy auth
+#
+# Batch TSV format (no header, # lines are comments):
+#   Title<TAB>Due(YYYY-MM-DD)<TAB>Start(HH:MM)<TAB>End(HH:MM)<TAB>Duration(min)<TAB>Notes
+#
+# Auth + account IDs stored in: ~/.config/flowsavvy/auth
+
+set -euo pipefail
+
+CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/flowsavvy/auth"
+API_URL='https://my.flowsavvy.app/api/Item/Create'
+BOUNDARY='----WebKitFormBoundaryFlowSavvy'
+
+# ── Load auth ─────────────────────────────────────────────────────────────────
+load_auth() {
+  if [[ ! -f "$CONFIG_FILE" ]]; then
+    echo "No auth config found. Run: flowsavvy auth" >&2
+    exit 1
+  fi
+  # shellcheck source=/dev/null
+  source "$CONFIG_FILE"
+  local missing=()
+  [[ -z "${CSRF_TOKEN:-}"    ]] && missing+=("CSRF_TOKEN")
+  [[ -z "${COOKIE:-}"        ]] && missing+=("COOKIE")
+  [[ -z "${TASK_LIST_ID:-}"  ]] && missing+=("TASK_LIST_ID")
+  [[ -z "${CALENDAR_ID:-}"   ]] && missing+=("CALENDAR_ID")
+  [[ -z "${TIME_PROFILE_ID:-}" ]] && missing+=("TIME_PROFILE_ID")
+  if [[ ${#missing[@]} -gt 0 ]]; then
+    echo "Auth config missing: ${missing[*]}" >&2
+    echo "Run: flowsavvy auth" >&2
+    exit 1
+  fi
+}
+
+# ── Auth setup ────────────────────────────────────────────────────────────────
+cmd_auth() {
+  echo ""
+  echo "To get these values, open FlowSavvy in Chrome, create any task,"
+  echo "then open DevTools → Network → find the /api/Item/Create request."
+  echo ""
+  echo "Paste your X-CSRF-TOKEN header value:"
+  read -r csrf
+  echo "Paste your Cookie header value:"
+  read -r cookie
+  echo ""
+  echo "Now look at the request Form Data for these IDs:"
+  echo "Paste taskListId:"
+  read -r task_list_id
+  echo "Paste calendarId:"
+  read -r calendar_id
+  echo "Paste timeProfileId:"
+  read -r time_profile_id
+
+  mkdir -p "$(dirname "$CONFIG_FILE")"
+  cat > "$CONFIG_FILE" <<EOF
+CSRF_TOKEN=${csrf}
+COOKIE=${cookie}
+TASK_LIST_ID=${task_list_id}
+CALENDAR_ID=${calendar_id}
+TIME_PROFILE_ID=${time_profile_id}
+EOF
+  chmod 600 "$CONFIG_FILE"
+  echo ""
+  echo "Auth saved to $CONFIG_FILE"
+}
+
+# ── Multipart body builder ────────────────────────────────────────────────────
+make_body() {
+  local title="$1" due="$2" start="$3" end="$4" dur="$5" notes="${6:-}"
+
+  field() { printf -- '--%s\r\nContent-Disposition: form-data; name="%s"\r\n\r\n%s\r\n' "$BOUNDARY" "$1" "$2"; }
+
+  field id                    0
+  field InstanceID            0
+  field Notes                 "<p>${notes}</p>"
+  field DueDateTime           "${due}T23:59"
+  field StartDateTime         "${start}"
+  field EndDateTime           "${end}"
+  field DontStartUntil        "0001-01-01T00:00"
+  field TimeZone              "Floating"
+  field IsAutoIgnored         "false"
+  field Title                 "$title"
+  field ItemType              "task"
+  field ProgressHours         0
+  field ProgressMinutes       0
+  field minLengthTotalMinutes "$dur"
+  field BufferTimeBeforeHours   0
+  field BufferTimeBeforeMinutes 10
+  field BufferTimeAfterHours    0
+  field BufferTimeAfterMinutes  15
+  field Busy                  "true"
+  field FixedTime             "false"
+  field AllDay                "false"
+  field RepeatType            "Never"
+  field Interval              1
+  for day in Sunday Monday Tuesday Wednesday Thursday Friday Saturday; do
+    field "$day" "false"
+  done
+  field MonthlyType           "Each..."
+  field Dates                 ""
+  field MonthOrdinal          0
+  field WeekDay               0
+  field EndRepeatType         "Never"
+  field EndRepeatDate         "2099-12-31T00:00"
+  field NumOccurrences        1
+  field priority              1
+  field customColor           ""
+  field taskListId            "$TASK_LIST_ID"
+  field calendarId            "$CALENDAR_ID"
+  field timeProfileId         "$TIME_PROFILE_ID"
+  field Location              ""
+  printf -- '--%s--\r\n' "$BOUNDARY"
+}
+
+# ── HTTP post ─────────────────────────────────────────────────────────────────
+post_task() {
+  local title="$1" due="$2" start_dt="$3" end_dt="$4" dur="$5" notes="${6:-}"
+
+  # Accept plain HH:MM — expand to full datetime using due date
+  [[ "$start_dt" != *T* ]] && start_dt="${due}T${start_dt}"
+  [[ "$end_dt"   != *T* ]] && end_dt="${due}T${end_dt}"
+
+  local body http_code
+  body=$(make_body "$title" "$due" "$start_dt" "$end_dt" "$dur" "$notes")
+
+  http_code=$(curl -s -o /tmp/flowsavvy_resp.json -w '%{http_code}' \
+    "$API_URL" \
+    -H "IsAxiosRequest: true" \
+    -H "X-CSRF-TOKEN: $CSRF_TOKEN" \
+    -H "Cookie: $COOKIE" \
+    -H "Referer: https://my.flowsavvy.app/app" \
+    -H "User-Agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
+    -H "Accept: application/json, text/plain, */*" \
+    -H "Content-Type: multipart/form-data; boundary=$BOUNDARY" \
+    --data-binary "$body")
+
+  case "$http_code" in
+    200)
+      local item_id
+      item_id=$(grep -o '"newItemId":[0-9]*' /tmp/flowsavvy_resp.json | grep -o '[0-9]*' || echo "?")
+      printf "[OK  id=%-10s] %s (due %s, %s min)\n" "$item_id" "$title" "$due" "$dur"
+      ;;
+    302|401)
+      printf "[AUTH EXPIRED] %s\n" "$title" >&2
+      echo "Session expired. Run: flowsavvy auth" >&2
+      exit 2
+      ;;
+    *)
+      printf "[ERR %s] %s\n" "$http_code" "$title" >&2
+      cat /tmp/flowsavvy_resp.json >&2
+      return 1
+      ;;
+  esac
+}
+
+# ── Commands ──────────────────────────────────────────────────────────────────
+cmd_add() {
+  if [[ $# -lt 5 ]]; then
+    echo 'Usage: flowsavvy add "Title" "YYYY-MM-DD" "HH:MM" "HH:MM" DURATION_MIN ["Notes"]' >&2
+    exit 1
+  fi
+  load_auth
+  post_task "$1" "$2" "$3" "$4" "$5" "${6:-}"
+}
+
+cmd_batch() {
+  local file="${1:--}"
+  load_auth
+  local ok=0 fail=0
+  while IFS=$'\t' read -r title due start end dur notes || [[ -n "${title:-}" ]]; do
+    [[ -z "${title:-}" || "$title" == \#* ]] && continue
+    if post_task "$title" "$due" "$start" "$end" "$dur" "${notes:-}"; then
+      (( ok++ )) || true
+    else
+      (( fail++ )) || true
+    fi
+  done < "$file"
+  echo ""
+  echo "Done: $ok created, $fail failed."
+}
+
+cmd_help() {
+  cat <<'EOF'
+flowsavvy — FlowSavvy task creator
+
+Commands:
+  add "Title" "YYYY-MM-DD" "HH:MM" "HH:MM" DURATION_MIN ["Notes"]
+        Create a single task. Start/End are clock times on the due date.
+
+  batch FILE.tsv
+        Create tasks from a TSV file (or stdin if FILE is -).
+        Columns (tab-separated): Title, Due, Start, End, Duration, Notes
+        Lines starting with # are ignored.
+
+  auth  Set up or refresh credentials (CSRF token, cookie, account IDs).
+
+Examples:
+  flowsavvy add "Physics Past Paper" "2026-04-15" "16:00" "16:45" 45 "30 MCQ timed"
+  flowsavvy batch tasks.tsv
+  cat tasks.tsv | flowsavvy batch -
+
+Auth:
+  Credentials live in ~/.config/flowsavvy/auth (chmod 600).
+  When you see [AUTH EXPIRED], run: flowsavvy auth
+  Get fresh values from Chrome DevTools → Network → any /api/Item/Create request.
+EOF
+}
+
+case "${1:-help}" in
+  add)    shift; cmd_add   "$@" ;;
+  batch)  shift; cmd_batch "$@" ;;
+  auth)   cmd_auth ;;
+  help|--help|-h) cmd_help ;;
+  *) echo "Unknown command: $1. Run: flowsavvy help" >&2; exit 1 ;;
+esac
