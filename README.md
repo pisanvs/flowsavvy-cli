@@ -15,7 +15,7 @@ flowsavvy add "Physics Past Paper" "2026-04-15" "16:00" "16:45" 45 "30 MCQ timed
 ## Install
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/flowsavvy-cli.git
+git clone https://github.com/pisanvs/flowsavvy-cli.git
 cd flowsavvy-cli
 chmod +x install.sh
 ./install.sh
